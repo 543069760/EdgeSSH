@@ -8,6 +8,9 @@ import { Keychain, fillKeychainSelect } from './keychain';
 import { countryFlag } from './flags';
 import { systemIcon } from './os-icons';
 import { testConnection } from './connection-test';
+import { sessionTargetKey } from './session-target';
+import { MAX_SESSIONS_PER_TARGET, SESSION_EVENT, type SessionSummary } from './session-manager';
+import type { ConnectionState } from './session-context';
 import './dashboard.css';
 
 interface DashboardActions {
@@ -16,9 +19,24 @@ interface DashboardActions {
   keychain: Keychain;
   refresh(): Promise<CloudHost[]>;
   connect(host: CloudHost): Promise<void>;
+  /** Dial the same target again as a *new* session instead of reusing one. */
+  newSession(host: CloudHost): Promise<void>;
   quickConnect(): void;
   leaveWorkspace(): void;
+  /** Every registered session; the dashboard renders it but never owns it. */
+  sessions(): SessionSummary[];
+  /** Id of the session bound to the shared UI, or null. */
+  activeSessionId(): string | null;
+  /** Localized copy for a connection state. */
+  stateLabel(state: ConnectionState): string;
+  /** Move a session to the front; gives it the terminal and the panels. */
+  activateSession(id: string): void;
+  /** Tear just this session down; every other one keeps running. */
+  closeSession(id: string): void;
 }
+
+/** States that mean "this session is doing something", i.e. deserves a badge. */
+const LIVE_STATES: ReadonlySet<ConnectionState> = new Set<ConnectionState>(['connecting', 'connected', 'disconnecting', 'error']);
 
 const icons = {
   home: '<path d="m3 10 9-7 9 7v10H3Z"/><path d="M9 20v-7h6v7"/>',
@@ -45,8 +63,17 @@ export class Dashboard {
   private authenticated = false;
   private returnFocus?: HTMLElement;
   private readonly dialog: HTMLDialogElement;
+  private readonly disconnectDialog: HTMLDialogElement;
   private readonly form: HTMLFormElement;
   private readonly forwarding = new ForwardPage();
+  /** Session centre panel — a sibling of the home content, like the files view. */
+  private readonly sessionsView = document.createElement('section');
+  /** Open host badge menu, if any; its DOM lives inside the owning host row. */
+  private openMenu?: HTMLElement;
+  /** Session waiting behind the disconnect confirmation dialog. */
+  private pendingDisconnectId?: string;
+  /** Last rendered session snapshot, so the host list is not rebuilt needlessly. */
+  private sessionSignature = '';
 
   constructor(private readonly actions: DashboardActions) {
     this.root.id = 'dashboard';
@@ -61,6 +88,7 @@ export class Dashboard {
         <nav class="home-rail" aria-label="主导航">
           <button class="rail-item selected" id="rail-overview" aria-current="page">${icon('home')}<span>总览</span></button>
           <button class="rail-item" id="rail-hosts">${icon('server')}<span>主机</span></button>
+          <button class="rail-item" id="rail-sessions">${icon('terminal')}<span>会话中心</span><span class="rail-badge" id="sessions-count" hidden></span></button>
           <button class="rail-item" id="rail-files">${icon('folder')}<span>文件管理</span></button>
           <button class="rail-item" id="rail-snippets">${icon('snippets')}<span>代码片段</span></button>
           <button class="rail-item" id="rail-keychain"><span>密钥链</span></button>
@@ -118,8 +146,18 @@ export class Dashboard {
           <p id="host-form-error" class="host-form-error" role="alert" hidden></p>
           <div class="dialog-actions"><button class="home-button close-dialog" type="button">取消</button><button class="home-button" id="test-cloud-host" type="button">测试连接</button><button class="home-button primary" id="save-cloud-host" type="submit">加密保存</button></div>
         </form>
+      </dialog>
+      <dialog id="session-disconnect-dialog" class="host-dialog session-disconnect-dialog" aria-labelledby="session-disconnect-title">
+        <div class="dialog-heading"><div><p class="home-eyebrow">DISCONNECT</p><h2 id="session-disconnect-title">断开这个会话？</h2></div></div>
+        <p class="dialog-intro" id="session-disconnect-body"></p>
+        <div class="dialog-actions">
+          <button class="home-button" id="session-disconnect-cancel" type="button">取消</button>
+          <button class="home-button danger" id="session-disconnect-confirm" type="button">断开会话</button>
+        </div>
       </dialog>`;
+    this.buildSessionsView();
     document.body.prepend(this.root);
+    this.get('.home-layout').append(this.sessionsView);
     this.get('.home-layout').append(this.actions.files.root);
     this.get('.home-layout').append(this.actions.snippets.page);
     this.get('.home-layout').append(this.forwarding.root);
@@ -127,7 +165,26 @@ export class Dashboard {
     this.get('#rail-keychain').prepend(createElement(KeyRound));
     this.actions.keychain.addEventListener('change', () => fillKeychainSelect(this.field('keychainId') as HTMLSelectElement, this.actions.keychain.keys));
     this.dialog = this.get<HTMLDialogElement>('#host-editor-dialog');
+    this.disconnectDialog = this.get<HTMLDialogElement>('#session-disconnect-dialog');
     this.form = this.get<HTMLFormElement>('#cloud-host-form');
+    this.get('#rail-sessions').addEventListener('click', () => this.showSessions());
+    this.get('#session-disconnect-cancel').addEventListener('click', () => this.disconnectDialog.close());
+    this.get('#session-disconnect-confirm').addEventListener('click', () => {
+      const id = this.pendingDisconnectId;
+      this.disconnectDialog.close();
+      if (id) this.actions.closeSession(id);
+    });
+    this.disconnectDialog.addEventListener('close', () => { this.pendingDisconnectId = undefined; });
+    // 下拉菜单是浮层：点到别处或按 Esc 都要收起，否则它会盖住其它主机的操作。
+    document.addEventListener('click', (event) => {
+      if (!this.openMenu) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('.session-menu') || target?.closest('.host-session-badge')) return;
+      this.closeSessionMenu();
+    });
+    document.addEventListener('keydown', (event) => { if (event.key === 'Escape') this.closeSessionMenu(); });
+    // 会话会在别处变动（拨号、断开、状态迁移），这里只是跟着重画。
+    window.addEventListener(SESSION_EVENT, () => this.renderSessionSurfaces());
     this.get('#account-action').addEventListener('click', async (event) => {
       if (!this.authenticated) return;
       event.preventDefault();
@@ -251,10 +308,7 @@ export class Dashboard {
   }
 
   show(): void {
-    this.actions.keychain.hide();
-    this.forwarding.hide();
-    this.actions.files.hide();
-    this.actions.snippets.hide();
+    this.hidePages();
     this.isHome = true; this.root.hidden = false;
     this.get('.home-content').hidden = false;
     this.selectNavigation('rail-overview');
@@ -264,10 +318,7 @@ export class Dashboard {
   }
 
   openWorkspace(): void {
-    this.actions.keychain.hide();
-    this.forwarding.hide();
-    this.actions.files.hide();
-    this.actions.snippets.hide();
+    this.hidePages();
     this.isHome = false; this.root.hidden = true;
     document.getElementById('app')!.hidden = false;
     document.body.dataset.view = 'workspace';
@@ -277,9 +328,7 @@ export class Dashboard {
   }
 
   showFiles(): void {
-    this.actions.keychain.hide();
-    this.forwarding.hide();
-    this.actions.snippets.hide();
+    this.hidePages();
     this.isHome = false; this.root.hidden = false;
     this.get('.home-content').hidden = true;
     document.getElementById('app')!.hidden = true;
@@ -291,10 +340,8 @@ export class Dashboard {
 
   showSnippets(): void {
     if (!this.actions.files.confirmLeave()) return;
-    this.actions.keychain.hide();
-    this.forwarding.hide();
+    this.hidePages();
     // 仅切换视图，不结束 SSH；在片段页编辑后可回到同一会话。
-    this.actions.files.hide();
     this.isHome = false; this.root.hidden = false;
     this.get('.home-content').hidden = true;
     document.getElementById('app')!.hidden = true;
@@ -306,9 +353,7 @@ export class Dashboard {
 
   showForwarding(): void {
     if (!this.actions.files.confirmLeave()) return;
-    this.actions.keychain.hide();
-    this.actions.files.hide();
-    this.actions.snippets.hide();
+    this.hidePages();
     this.isHome = false; this.root.hidden = false;
     this.get('.home-content').hidden = true;
     document.getElementById('app')!.hidden = true;
@@ -320,13 +365,250 @@ export class Dashboard {
 
   showKeychain(): void {
     if (!this.actions.files.confirmLeave()) return;
-    this.actions.files.hide(); this.actions.snippets.hide(); this.forwarding.hide();
+    this.hidePages();
     this.isHome = false; this.root.hidden = false;
     this.get('.home-content').hidden = true;
     document.getElementById('app')!.hidden = true;
     document.body.dataset.view = 'keychain'; this.selectNavigation('rail-keychain');
     this.get('#rail-keychain').scrollIntoView({ block: 'nearest', inline: 'nearest' });
     this.globe?.setActive(false); this.actions.keychain.show();
+  }
+
+  showSessions(): void {
+    if (!this.actions.files.confirmLeave()) return;
+    this.hidePages();
+    // 切换视图不会动 SSH；会话中心只是会话的另一块说明牌。
+    this.isHome = false; this.root.hidden = false;
+    this.get('.home-content').hidden = true;
+    document.getElementById('app')!.hidden = true;
+    document.body.dataset.view = 'sessions';
+    this.selectNavigation('rail-sessions');
+    this.globe?.setActive(false);
+    this.sessionsView.hidden = false;
+    this.renderSessionList();
+    this.get('#sessions-heading').focus();
+  }
+
+  /** Hide every sibling page, including the session centre. */
+  private hidePages(): void {
+    this.actions.keychain.hide();
+    this.forwarding.hide();
+    this.actions.files.hide();
+    this.actions.snippets.hide();
+    this.closeSessionMenu();
+    this.sessionsView.hidden = true;
+  }
+
+  // -----------------------------------------------------------------------
+  // Multi-session surfaces: host badge + menu, rail badge, session centre.
+  // The dashboard stays a view — `main.ts` owns the sessions themselves.
+  // -----------------------------------------------------------------------
+
+  private liveSessions(): SessionSummary[] {
+    return this.actions.sessions().filter((session) => LIVE_STATES.has(session.state));
+  }
+
+  private sessionsFor(targetKey: string): SessionSummary[] {
+    return this.liveSessions().filter((session) => session.targetKey === targetKey);
+  }
+
+  /**
+   * A session only knows `user@host:port`; running that back through the host
+   * list is what lets the session centre say "Tokyo production" instead.
+   */
+  private sessionTitle(session: SessionSummary): string {
+    const match = this.hosts.find((host) => sessionTargetKey(host.host, host.port, host.username) === session.targetKey);
+    return match?.name ?? (session.label || session.targetKey);
+  }
+
+  /** Cheap equality check for "would any badge look different?". */
+  private liveSignature(): string {
+    return this.liveSessions().map((session) => `${session.id}@${session.targetKey}:${session.state}`).join('|');
+  }
+
+  /** Called on every registry change so the dashboard cannot fall out of sync. */
+  private renderSessionSurfaces(): void {
+    this.renderSessionCount();
+    const signature = this.liveSignature();
+    if (signature !== this.sessionSignature) {
+      this.sessionSignature = signature;
+      // Badges live inside host rows, so keeping them truthful means rebuilding
+      // the rows; the menu would otherwise point at a session that is gone.
+      if (!this.root.hidden && !this.get('.home-content').hidden) this.renderList();
+      if (!this.sessionsView.hidden) this.renderSessionList();
+      if (this.openMenu) {
+        if (this.sessionsFor(this.openMenu.dataset.target ?? '').length) this.refreshSessionMenu();
+        else this.closeSessionMenu();
+      }
+    }
+  }
+
+  private renderSessionCount(): void {
+    const count = this.liveSessions().length;
+    const badge = this.get('#sessions-count');
+    badge.textContent = String(count);
+    badge.hidden = count === 0;
+    badge.setAttribute('aria-label', `${count} 个运行中的会话`);
+    this.get('#rail-sessions').title = count ? `${count} 个运行中的会话` : '没有运行中的会话';
+  }
+
+  private renderSessionList(): void {
+    const list = this.get('#session-list');
+    const sessions = this.liveSessions();
+    this.get('#sessions-total').textContent = `${sessions.length} 个会话`;
+    list.replaceChildren();
+    const activeId = this.actions.activeSessionId();
+    if (!sessions.length) {
+      const empty = document.createElement('div'); empty.className = 'home-empty';
+      empty.innerHTML = `${icon('terminal')}<strong></strong><p></p>`;
+      empty.querySelector('strong')!.textContent = '暂无运行中的会话';
+      empty.querySelector('p')!.textContent = '在主机列表点击「连接」，会话会同时出现在这里。';
+      list.append(empty); return;
+    }
+    for (const session of sessions) {
+      const card = document.createElement('article');
+      card.className = session.id === activeId ? 'session-card current' : 'session-card';
+      card.dataset.session = session.id;
+      const heading = document.createElement('div'); heading.className = 'session-card-heading';
+      const label = document.createElement('strong'); label.textContent = this.sessionTitle(session);
+      const state = document.createElement('span');
+      state.className = `session-state ${session.state}`;
+      state.textContent = this.actions.stateLabel(session.state);
+      heading.append(label, state);
+      if (session.id === activeId) {
+        const current = document.createElement('span'); current.className = 'session-current-tag'; current.textContent = '当前';
+        heading.append(current);
+      }
+      const meta = document.createElement('span'); meta.className = 'session-card-meta';
+      const started = new Date(session.startedAt).toLocaleTimeString('zh-CN', { hour12: false });
+      meta.textContent = `${session.label || session.targetKey} · 建立于 ${started}`;
+      const name = this.sessionTitle(session);
+      const actions = document.createElement('div'); actions.className = 'session-card-actions';
+      const activate = document.createElement('button');
+      activate.className = 'home-button'; activate.type = 'button'; activate.textContent = '切换到工作台';
+      activate.dataset.activate = session.id;
+      activate.setAttribute('aria-label', `切换到会话 ${name}`);
+      activate.addEventListener('click', () => this.switchToSession(session.id));
+      const close = document.createElement('button');
+      close.className = 'home-button danger'; close.type = 'button'; close.textContent = '断开';
+      close.dataset.disconnect = session.id;
+      close.setAttribute('aria-label', `断开会话 ${name}`);
+      close.addEventListener('click', () => this.confirmDisconnect(session.id));
+      actions.append(activate, close);
+      card.append(heading, meta, actions);
+      list.append(card);
+    }
+  }
+
+  private switchToSession(id: string): void {
+    this.closeSessionMenu();
+    this.actions.activateSession(id);
+    this.openWorkspace();
+  }
+
+  /** Disconnecting one session is destructive, so it always asks first. */
+  private confirmDisconnect(id: string): void {
+    const session = this.actions.sessions().find((item) => item.id === id);
+    if (!session) return;
+    this.pendingDisconnectId = id;
+    const name = this.sessionTitle(session);
+    this.get('#session-disconnect-body').textContent =
+      `${name} 的文件传输会随这个会话结束；其它会话不受影响。`;
+    this.disconnectDialog.showModal();
+    this.get<HTMLButtonElement>('#session-disconnect-cancel').focus();
+  }
+
+  private toggleSessionMenu(targetKey: string, anchor: HTMLElement, host: CloudHost): void {
+    const wasOpen = this.openMenu?.dataset.target === targetKey;
+    this.closeSessionMenu();
+    if (wasOpen) return;
+    const menu = this.buildSessionMenu(targetKey, host, anchor);
+    if (!menu) return;
+    menu.dataset.target = targetKey;
+    menu.dataset.hostId = host.id;
+    anchor.after(menu);
+    anchor.setAttribute('aria-expanded', 'true');
+    this.openMenu = menu;
+    menu.querySelector('button')?.focus();
+  }
+
+  private refreshSessionMenu(): void {
+    const menu = this.openMenu;
+    const targetKey = menu?.dataset.target;
+    const host = this.hosts.find((item) => item.id === menu?.dataset.hostId);
+    const anchor = menu?.previousElementSibling as HTMLElement | null;
+    if (!menu || !targetKey || !host || !anchor) { this.closeSessionMenu(); return; }
+    const rebuilt = this.buildSessionMenu(targetKey, host, anchor);
+    if (!rebuilt) { this.closeSessionMenu(); return; }
+    rebuilt.dataset.target = targetKey;
+    rebuilt.dataset.hostId = host.id;
+    menu.replaceWith(rebuilt);
+    this.openMenu = rebuilt;
+  }
+
+  private buildSessionMenu(targetKey: string, host: CloudHost, anchor: HTMLElement): HTMLElement | null {
+    const sessions = this.sessionsFor(targetKey);
+    if (!sessions.length) return null;
+    const menu = document.createElement('div');
+    menu.className = 'session-menu';
+    menu.setAttribute('role', 'menu');
+    const activeId = this.actions.activeSessionId();
+    for (const session of sessions) {
+      const row = document.createElement('div'); row.className = 'session-menu-row';
+      const name = this.sessionTitle(session);
+      const label = document.createElement('span'); label.className = 'session-menu-label';
+      label.textContent = name;
+      label.title = session.targetKey;
+      const state = document.createElement('span'); state.className = `session-menu-state ${session.state}`;
+      state.textContent = this.actions.stateLabel(session.state);
+      const activate = document.createElement('button');
+      activate.type = 'button'; activate.className = 'home-button session-menu-button';
+      activate.textContent = session.id === activeId ? '回到工作台' : '切换';
+      activate.dataset.activate = session.id;
+      activate.setAttribute('aria-label', `切换到会话 ${name}`);
+      activate.addEventListener('click', () => this.switchToSession(session.id));
+      const close = document.createElement('button');
+      close.type = 'button'; close.className = 'home-button danger session-menu-button';
+      close.textContent = '断开';
+      close.dataset.disconnect = session.id;
+      close.setAttribute('aria-label', `断开会话 ${name}`);
+      close.addEventListener('click', () => this.confirmDisconnect(session.id));
+      row.append(label, state, activate, close);
+      menu.append(row);
+    }
+    menu.append(this.buildAnotherSessionRow(sessions.length, host, anchor));
+    return menu;
+  }
+
+  /** Second shell for the same target — otherwise the per-target cap is unreachable. */
+  private buildAnotherSessionRow(count: number, host: CloudHost, anchor: HTMLElement): HTMLElement {
+    const another = document.createElement('button');
+    another.type = 'button'; another.className = 'home-button session-menu-new';
+    another.textContent = '＋ 再开一个会话';
+    const atLimit = count >= MAX_SESSIONS_PER_TARGET;
+    another.disabled = atLimit;
+    another.title = atLimit ? `该主机最多 ${MAX_SESSIONS_PER_TARGET} 个会话。` : `为 ${host.name} 再开一个会话`;
+    another.addEventListener('click', () => void this.openAnotherSession(host, anchor));
+    return another;
+  }
+
+  private closeSessionMenu(): void {
+    this.openMenu?.remove();
+    this.openMenu = undefined;
+    this.root.querySelectorAll<HTMLElement>('.host-session-badge').forEach((badge) => badge.setAttribute('aria-expanded', 'false'));
+  }
+
+  private buildSessionsView(): void {
+    this.sessionsView.id = 'sessions-pane';
+    this.sessionsView.className = 'sessions-page';
+    this.sessionsView.hidden = true;
+    this.sessionsView.setAttribute('aria-labelledby', 'sessions-heading');
+    this.sessionsView.innerHTML = `
+      <header class="home-section-heading"><div><p class="home-eyebrow">LIVE SESSIONS</p>
+        <h1 id="sessions-heading" tabindex="-1">会话中心</h1>
+        <p>每一条会话各自连着一台主机；切换到工作台查看它，或单独断开。</p></div>
+        <span class="home-eyebrow" id="sessions-total">0 个会话</span></header>
+      <div id="session-list" class="session-list" aria-live="polite"></div>`;
   }
 
   private selectNavigation(id: string): void {
@@ -415,6 +697,26 @@ export class Dashboard {
         location.append(relocate);
         const connect = document.createElement('button'); connect.className = 'home-button connect-host'; connect.textContent = '连接'; connect.type = 'button';
         connect.addEventListener('click', () => void this.connectHost(host));
+        // 「连接」与会话徽标共处一列：原先的六列行网格和三档断点里的定位规则
+        // 都不用为多会话再加一列，只需在最外层替换成这个容器。
+        const rowActions = document.createElement('div'); rowActions.className = 'host-actions';
+        const key = sessionTargetKey(host.host, host.port, host.username);
+        const active = this.sessionsFor(key);
+        if (active.length) {
+          const badge = document.createElement('button');
+          badge.type = 'button'; badge.className = 'host-session-badge'; badge.dataset.target = key;
+          badge.setAttribute('aria-haspopup', 'menu');
+          badge.setAttribute('aria-expanded', 'false');
+          badge.textContent = String(active.length);
+          badge.title = `${host.name} 有 ${active.length} 个运行中的会话`;
+          badge.setAttribute('aria-label', badge.title);
+          badge.addEventListener('click', (clickEvent) => {
+            clickEvent.stopPropagation();
+            this.toggleSessionMenu(key, badge, host);
+          });
+          rowActions.append(badge);
+        }
+        rowActions.append(connect);
         const edit = document.createElement('button'); edit.className = 'host-row-action'; edit.textContent = '编辑'; edit.type = 'button'; edit.setAttribute('aria-label', `编辑 ${host.name}`);
         edit.addEventListener('click', () => this.openEditor(host));
         const remove = document.createElement('button'); remove.className = 'host-row-action delete'; remove.textContent = '×'; remove.type = 'button'; remove.setAttribute('aria-label', `删除 ${host.name}`);
@@ -424,9 +726,12 @@ export class Dashboard {
           try { await removeHost(host.id); await this.refresh(); }
           catch (error) { this.notice(error instanceof Error ? error.message : '删除失败。'); remove.disabled = false; }
         });
-        row.append(symbol, copy, location, connect, edit, remove); list.append(row);
+        row.append(symbol, copy, location, rowActions, edit, remove); list.append(row);
       }
     }
+    // 徽标是从这里渲染的，所以重画后的快照就已经是最新的了。
+    this.sessionSignature = this.liveSignature();
+    this.renderSessionCount();
   }
 
   private async refreshLocation(host: CloudHost, button: HTMLButtonElement): Promise<void> {
@@ -452,6 +757,22 @@ export class Dashboard {
     try { await this.actions.connect(host); this.openWorkspace(); this.get('#home-notice').hidden = true; }
     catch (error) { this.notice(error instanceof Error ? error.message : '连接准备失败。'); }
     finally { this.busy = false; this.root.removeAttribute('aria-busy'); }
+  }
+
+  /** Same target again, but deliberately a second shell instead of reusing one. */
+  private async openAnotherSession(host: CloudHost, anchor?: HTMLElement): Promise<void> {
+    if (this.busy) return;
+    this.busy = true; this.root.setAttribute('aria-busy', 'true');
+    this.notice(`正在为 ${host.name} 再开一个会话…`);
+    try {
+      this.closeSessionMenu();
+      await this.actions.newSession(host);
+      this.openWorkspace();
+      this.get('#home-notice').hidden = true;
+    } catch (error) {
+      this.notice(error instanceof Error ? error.message : '无法为该主机再开会话。');
+      if (anchor) this.toggleSessionMenu(sessionTargetKey(host.host, host.port, host.username), anchor, host);
+    } finally { this.busy = false; this.root.removeAttribute('aria-busy'); }
   }
 
   private openEditor(host?: CloudHost): void {
