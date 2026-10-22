@@ -3,18 +3,34 @@ import type { CloudHost } from './cloud-api';
 import { countryFlagEmoji } from './flags';
 
 type Point = [number, number, number];
+export type GlobeView = 'sphere' | 'flat';
+/** Land and graticule samples stay geographic so both projections can read them. */
+type Sample = { lat: number; lon: number; unit: Point };
 const AUTO_ROTATION_SPEED = 0.000099;
+const MORPH_MS = 720;
+const FLAT_CORNER = 10;
+/**
+ * Unrolling stretches high latitudes sideways, which thins the dot rows exactly
+ * where the shared sampling is already coarsest. Softening the vertical term of
+ * the radial falloff pays those rows back their brightness — and with it their
+ * size, since both derive from the same depth value.
+ */
+const FLAT_DEPTH_V = 0.7;
 
 function sphere(lat: number, lon: number): Point {
   const a = lat * Math.PI / 180, b = lon * Math.PI / 180;
   return [Math.cos(a) * Math.sin(b), Math.sin(a), Math.cos(a) * Math.cos(b)];
 }
 
+function mix(a: number, b: number, t: number): number { return a + (b - a) * t; }
+function wrap(lon: number): number { return ((lon + 540) % 360) - 180; }
+
 export class HostGlobe {
   private readonly canvas = document.createElement('canvas');
   private readonly context: CanvasRenderingContext2D;
-  private readonly points: Point[] = [];
-  private markers: { point: Point; button: HTMLButtonElement }[] = [];
+  private readonly samples: Sample[] = [];
+  private readonly graticule: Sample[][] = [];
+  private markers: { sample: Sample; button: HTMLButtonElement }[] = [];
   private readonly motion = matchMedia('(prefers-reduced-motion: reduce)');
   private angle = -1.5;
   private frame = 0;
@@ -24,6 +40,11 @@ export class HostGlobe {
   private dragging = false;
   private pointerX = 0;
   private size = 0;
+  private view: GlobeView = 'sphere';
+  /** 0 = sphere, 1 = fully unrolled; the one knob every draw path reads. */
+  private progress = 0;
+  private morphFrom = 0;
+  private morphAt = 0;
   private readonly resize: ResizeObserver;
   private readonly orange: string;
   private readonly grid: string;
@@ -40,10 +61,28 @@ export class HostGlobe {
     // 复用 Mappo 的真实陆地掩码；一次预计算坐标，旋转时不再遍历地理数据。
     for (let lat = -82; lat <= 84; lat += 1.8) {
       const step = 1.8 / Math.max(0.2, Math.cos(lat * Math.PI / 180));
-      for (let lon = -180; lon < 180; lon += step) if (isLand(lat, lon)) this.points.push(sphere(lat, lon));
+      for (let lon = -180; lon < 180; lon += step) {
+        if (isLand(lat, lon)) this.samples.push({ lat, lon, unit: sphere(lat, lon) });
+      }
+    }
+    for (let lat = -60; lat <= 60; lat += 30) {
+      this.graticule.push(Array.from({ length: 121 }, (_, i): Sample => {
+        const lon = i * 3 - 180;
+        return { lat, lon, unit: sphere(lat, lon) };
+      }));
+    }
+    for (let lon = -180; lon < 180; lon += 30) {
+      this.graticule.push(Array.from({ length: 61 }, (_, i): Sample => {
+        const lat = i * 3 - 90;
+        return { lat, lon, unit: sphere(lat, lon) };
+      }));
     }
     this.resize = new ResizeObserver(() => {
-      this.size = root.clientWidth;
+      // A transient relayout can report zero width; resizing to 0 would wipe
+      // the bitmap and never repaint it.
+      const width = root.clientWidth;
+      if (!width) return;
+      this.size = width;
       const scale = Math.min(devicePixelRatio, 2);
       this.canvas.width = this.canvas.height = Math.round(this.size * scale);
       this.context.setTransform(scale, 0, 0, scale, 0, 0);
@@ -51,6 +90,7 @@ export class HostGlobe {
     });
     this.resize.observe(root);
     this.canvas.addEventListener('pointerdown', (event) => {
+      if (this.view === 'flat') return;
       this.dragging = true; this.pointerX = event.clientX;
       this.canvas.setPointerCapture(event.pointerId);
     });
@@ -84,7 +124,8 @@ export class HostGlobe {
       copy.append(name, city); button.append(pin, copy);
       button.addEventListener('click', () => this.connect(host));
       this.root.append(button);
-      return { point: sphere(location.latitude, location.longitude), button };
+      const lat = location.latitude, lon = location.longitude;
+      return { sample: { lat, lon, unit: sphere(lat, lon) }, button };
     });
     this.draw();
   }
@@ -92,39 +133,87 @@ export class HostGlobe {
   setActive(active: boolean): void { this.active = active; this.schedule(); }
   setPaused(paused: boolean): void { this.active = !paused; this.schedule(); }
 
+  /**
+   * Switch between the spinning globe and the unrolled map. The unrolled view
+   * shows every meridian at once, so it neither spins nor drags — it simply
+   * settles and stops repainting.
+   */
+  setView(view: GlobeView, animate = true): void {
+    if (this.view === view) return;
+    this.view = view;
+    if (!animate) this.progress = view === 'flat' ? 1 : 0;
+    this.morphFrom = this.progress;
+    this.morphAt = performance.now();
+    this.canvas.style.cursor = view === 'flat' ? 'default' : '';
+    this.root.dataset.view = view;
+    this.schedule();
+  }
+
+  get currentView(): GlobeView { return this.view; }
+
   private schedule(): void {
     cancelAnimationFrame(this.frame);
     this.last = 0;
-    if (this.active && !document.hidden && !this.motion.matches) this.frame = requestAnimationFrame(this.tick);
-    else this.draw();
+    if (this.motion.matches) { this.progress = this.view === 'flat' ? 1 : 0; this.draw(); return; }
+    if (!this.active || document.hidden) { this.draw(); return; }
+    // Unrolled + settled: nothing will move again, so don't hold a frame loop.
+    if (this.view === 'flat' && this.progress === 1) { this.draw(); return; }
+    this.frame = requestAnimationFrame(this.tick);
+  }
+
+  private advance(time: number): void {
+    const target = this.view === 'flat' ? 1 : 0;
+    if (this.progress === target) return;
+    const ratio = Math.min(1, (time - this.morphAt) / MORPH_MS);
+    const eased = ratio < 0.5 ? 2 * ratio * ratio : 1 - 2 * (1 - ratio) ** 2;
+    this.progress = ratio >= 1 ? target : mix(this.morphFrom, target, eased);
   }
 
   private readonly tick = (time: number): void => {
     if (this.last && time - this.last < 32) { this.frame = requestAnimationFrame(this.tick); return; }
     const delta = this.last ? Math.min(time - this.last, 100) : 0;
     this.last = time;
-    if (!this.paused && !this.dragging) this.angle += delta * AUTO_ROTATION_SPEED;
+    this.advance(time);
+    // Only the sphere spins — the map is the whole world laid out at once.
+    if (this.progress < 1 && !this.paused && !this.dragging) this.angle += delta * AUTO_ROTATION_SPEED;
     this.draw();
+    if (this.view === 'flat' && this.progress === 1) { this.last = 0; return; }
     this.frame = requestAnimationFrame(this.tick);
   };
 
-  private project(point: Point): Point {
-    const [x, y, z] = point, s = Math.sin(this.angle), c = Math.cos(this.angle);
+  /**
+   * Screen position of a sample for the current morph progress: the sphere's
+   * spinning projection eased into the flat one. The third value replaces the
+   * sphere's depth with a radial falloff, so both shapes shade the same way —
+   * brightest dead centre, fading to nothing at the rim.
+   */
+  private place(sample: Sample): Point {
+    const { lat, lon, unit } = sample;
+    const [x, y, z] = unit, s = Math.sin(this.angle), c = Math.cos(this.angle);
     const rx = x * c + z * s, rz = z * c - x * s;
     const tilt = 0.18;
-    return [rx, y * Math.cos(tilt) - rz * Math.sin(tilt), y * Math.sin(tilt) + rz * Math.cos(tilt)];
+    const sy = y * Math.cos(tilt) - rz * Math.sin(tilt);
+    const sz = y * Math.sin(tilt) + rz * Math.cos(tilt);
+    // The map is centred on the prime meridian; easing the offset out keeps
+    // the unroll continuous even if the globe was mid-spin.
+    const u = wrap(lon + this.angle * (180 / Math.PI) * (1 - this.progress)) / 180;
+    const v = lat / 90;
+    const radial = 1 - Math.min(1, Math.hypot(u, v * FLAT_DEPTH_V));
+    // Latitude runs north-up, matching the sphere where +y draws upward.
+    return [mix(rx, u, this.progress), mix(sy, v * 0.5, this.progress), mix(sz, radial, this.progress)];
   }
 
   private draw(): void {
     if (!this.size) return;
     const ctx = this.context, size = this.size, center = size / 2, radius = size * 0.405;
     ctx.clearRect(0, 0, size, size);
-    ctx.beginPath(); ctx.arc(center, center, radius, 0, Math.PI * 2);
-    ctx.fillStyle = this.paper; ctx.fill(); ctx.strokeStyle = this.grid; ctx.lineWidth = 0.8; ctx.stroke();
-    const drawLine = (points: Point[]) => {
+    this.drawFrame(ctx, center, radius);
+    const drawLine = (points: Sample[]) => {
       ctx.beginPath(); let started = false;
       for (const point of points) {
-        const [x, y, z] = this.project(point);
+        const [x, y, z] = this.place(point);
+        // z < 0 hides the far hemisphere on the globe; the map's radial depth
+        // bottoms out at exactly 0, so nothing gets clipped once unrolled.
         if (z < 0) { started = false; continue; }
         if (started) ctx.lineTo(center + x * radius, center - y * radius);
         else ctx.moveTo(center + x * radius, center - y * radius);
@@ -133,11 +222,10 @@ export class HostGlobe {
       ctx.stroke();
     };
     ctx.globalAlpha = 0.7;
-    for (let lat = -60; lat <= 60; lat += 30) drawLine(Array.from({ length: 121 }, (_, i) => sphere(lat, i * 3 - 180)));
-    for (let lon = -180; lon < 180; lon += 30) drawLine(Array.from({ length: 61 }, (_, i) => sphere(i * 3 - 90, lon)));
+    for (const line of this.graticule) drawLine(line);
     ctx.fillStyle = this.orange;
-    for (const point of this.points) {
-      const [x, y, z] = this.project(point);
+    for (const point of this.samples) {
+      const [x, y, z] = this.place(point);
       if (z < 0) continue;
       ctx.globalAlpha = 0.25 + z * 0.7;
       ctx.beginPath(); ctx.arc(center + x * radius, center - y * radius, (0.55 + z * 0.65) * size / 460, 0, Math.PI * 2); ctx.fill();
@@ -145,9 +233,10 @@ export class HostGlobe {
     ctx.globalAlpha = 1;
     const occupied: { x: number; y: number }[] = [];
     for (const marker of this.markers) {
-      const [x, y, z] = this.project(marker.point);
+      const [x, y, z] = this.place(marker.sample);
       const px = center + x * radius, py = center - y * radius;
-      marker.button.hidden = z < 0.12;
+      // Same idea as the clip above: the map stops hiding markers as it opens.
+      marker.button.hidden = z < 0.12 * (1 - this.progress);
       if (marker.button.hidden) continue;
       // 密集地区折叠文字而不是堆叠卡片；每台机器始终还可从左侧列表连接。
       const overlap = occupied.some((other) => Math.abs(other.x - px) < 100 && Math.abs(other.y - py) < 44);
@@ -156,5 +245,17 @@ export class HostGlobe {
       marker.button.style.transform = `translate(${px}px, ${py}px)`;
       marker.button.style.zIndex = String(Math.round(z * 10));
     }
+  }
+
+  /** A circle that unrolls into a 2:1 rounded rect — at t=0 the rect *is* the circle. */
+  private drawFrame(ctx: CanvasRenderingContext2D, center: number, radius: number): void {
+    const t = this.progress;
+    const x = center - radius;
+    const y = mix(center - radius, center - radius / 2, t);
+    const height = mix(radius * 2, radius, t);
+    const corner = mix(radius, FLAT_CORNER, t);
+    ctx.beginPath();
+    ctx.roundRect(x, y, radius * 2, height, Math.min(corner, height / 2));
+    ctx.fillStyle = this.paper; ctx.fill(); ctx.strokeStyle = this.grid; ctx.lineWidth = 0.8; ctx.stroke();
   }
 }

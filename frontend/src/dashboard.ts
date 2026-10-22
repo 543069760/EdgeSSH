@@ -1,8 +1,11 @@
 import { api, saveHost, removeHost, refreshHostLocation, hostCredentials, type CloudHost, type HostInput } from './cloud-api';
-import type { HostGlobe } from './globe';
+import type { HostGlobe, GlobeView } from './globe';
 import type { FilePage } from './file-page';
 import type { Snippets } from './snippets';
 import { ForwardPage } from './forward-page';
+
+/** Remembered shape of the home map; same key family as the session store. */
+const GLOBE_VIEW_KEY = 'edgessh.globe-view.v1';
 import { createElement, KeyRound } from 'lucide';
 import { Keychain, fillKeychainSelect } from './keychain';
 import { countryFlag } from './flags';
@@ -60,6 +63,7 @@ export class Dashboard {
   private busy = false;
   private isHome = true;
   private paused = false;
+  private globeView: GlobeView = 'sphere';
   private authenticated = false;
   private returnFocus?: HTMLElement;
   private readonly dialog: HTMLDialogElement;
@@ -114,7 +118,7 @@ export class Dashboard {
             <section class="globe-pane" aria-labelledby="globe-heading">
               <div class="globe-heading"><p class="home-eyebrow">A SMALLER WORLD</p><h2 id="globe-heading">散布全球，<br><span>就在手边。</span></h2><p>点击国旗，即刻连接。</p></div>
               <div class="host-globe" id="host-globe" aria-label="主机地理分布，可拖动旋转；也可使用主机列表连接"></div>
-              <div class="globe-meta"><span id="region-count">0 个地区</span><button id="pause-globe" class="home-text-button" aria-pressed="false">暂停旋转</button></div>
+              <div class="globe-meta"><span id="region-count">0 个地区</span><span class="globe-actions"><button id="pause-globe" class="home-text-button" aria-pressed="false">暂停旋转</button><button id="globe-view" class="home-text-button" aria-pressed="false">平铺地图</button></span></div>
               <p class="globe-caption">城市级近似定位 · 位置不代表在线状态</p>
             </section>
           </div>
@@ -248,6 +252,11 @@ export class Dashboard {
       this.get('#pause-globe').textContent = this.paused ? '继续旋转' : '暂停旋转';
       this.globe?.setActive(!this.paused);
     });
+    this.get('#globe-view').addEventListener('click', () => this.setGlobeView(this.globeView === 'flat' ? 'sphere' : 'flat'));
+    try {
+      const saved = localStorage.getItem(GLOBE_VIEW_KEY);
+      if (saved === 'flat' || saved === 'sphere') this.setGlobeView(saved, false);
+    } catch { /* 隐私模式下读不到 localStorage，保持默认球体 */ }
     document.addEventListener('keydown', (event) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k' && this.isHome && !this.dialog.open) {
         event.preventDefault(); this.get<HTMLInputElement>('#host-search').focus();
@@ -295,7 +304,26 @@ export class Dashboard {
       this.globe = new HostGlobe(this.get('#host-globe'), (host) => void this.connectHost(host));
       this.globe.setHosts(this.hosts);
       this.globe.setActive(this.isHome && !this.paused);
+      // Restore without replaying the unroll animation on every page load.
+      if (this.globeView !== 'sphere') this.globe.setView(this.globeView, false);
     } catch { this.get('#host-globe').textContent = '地图暂不可用，请从主机列表连接。'; }
+  }
+
+  private setGlobeView(view: GlobeView, animate = true): void {
+    this.globeView = view;
+    const flat = view === 'flat';
+    const toggle = this.get('#globe-view');
+    toggle.setAttribute('aria-pressed', String(flat));
+    toggle.textContent = flat ? '收回球体' : '平铺地图';
+    // The unrolled map is every meridian at once — it never spins, so there is
+    // nothing to pause. Hidden rather than removed: the meta row keeps its
+    // layout instead of reflowing on every switch.
+    this.get('#pause-globe').classList.toggle('is-hidden', flat);
+    this.get('#host-globe').setAttribute('aria-label', flat
+      ? '主机地理分布平铺地图，全部经度一次展开；点击标记或左侧列表连接'
+      : '主机地理分布，可拖动旋转；也可使用主机列表连接');
+    this.globe?.setView(view, animate);
+    try { localStorage.setItem(GLOBE_VIEW_KEY, view); } catch { /* 隐私模式下忽略 */ }
   }
 
   setHosts(hosts: CloudHost[]): void {

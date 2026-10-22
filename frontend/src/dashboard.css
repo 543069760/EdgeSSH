@@ -151,6 +151,9 @@ body[data-view='dashboard'] { overflow-y: auto; background: var(--home-bg); }
 .globe-marker.compact .globe-label { display: none; }
 .globe-marker:hover .globe-label, .globe-marker:focus-visible .globe-label { display: block; }
 .globe-meta { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; color: var(--home-muted); font-size: 12px; }
+.globe-actions { display: flex; align-items: center; gap: 14px; }
+/* Kept in the layout (just invisible): the unrolled map has no spin to pause. */
+#dashboard #pause-globe.is-hidden { visibility: hidden; }
 .globe-caption { margin: 0; padding: 0 16px; color: var(--home-muted); font-size: 10px; }
 .home-bottom { margin-top: 28px; display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 16px; }
 .storage-note, #dashboard .quick-card { display: flex; align-items: center; gap: 16px; border: 1px solid var(--home-line); border-radius: 9px; background: var(--home-surface); padding: 23px; text-align: left; }
