@@ -79,7 +79,13 @@ export class Dashboard {
     this.root.id = 'dashboard';
     this.root.innerHTML = `
       <header class="home-header">
-        <a class="home-brand" href="/" aria-label="EdgeSSH 首页"><span class="brand-chevron">›_</span>Edge<span>SSH</span></a>
+        <!--
+          这里原本是 href="/" 的链接：点击会整页导航到首页，而启动流程末尾的
+          restorePersistedSessions() 又会立刻把已存在的会话接回工作台 —— 看起来
+          就是「点 logo 误跳终端页」。改成按钮后点击只在当前页内重新拉取
+          主机/会话数据，不再重新加载页面。
+        -->
+        <button type="button" class="home-brand" aria-label="刷新首页" title="刷新首页"><span class="brand-chevron">›_</span>Edge<span>SSH</span></button>
         <label class="home-search">${icon('search')}<input id="host-search" type="search" placeholder="搜索主机、分组或 IP 地址" aria-label="搜索主机"><kbd>Ctrl K</kbd></label>
         <button class="home-button primary header-add" data-add>＋ 新建主机</button>
         <div class="home-account"><span class="account-avatar">A</span><span id="account-label">验证身份中</span><a id="account-action" href="/auth/login" title="管理员登录">登录</a></div>
@@ -199,6 +205,10 @@ export class Dashboard {
     this.dialog.addEventListener('cancel', (event) => { if (this.busy) event.preventDefault(); });
     this.dialog.addEventListener('close', () => { this.form.reset(); this.editing = undefined; this.returnFocus?.focus(); });
     this.get('#host-search').addEventListener('input', () => this.renderList());
+    this.get<HTMLButtonElement>('.home-brand').addEventListener('click', () => {
+      if (!this.actions.files.confirmLeave()) return;
+      this.show(); void this.refresh();
+    });
     this.get('#refresh-hosts').addEventListener('click', () => void this.refresh());
     for (const id of ['#rail-overview', '#rail-hosts']) this.get(id).addEventListener('click', () => {
       if (!this.actions.files.confirmLeave()) return;

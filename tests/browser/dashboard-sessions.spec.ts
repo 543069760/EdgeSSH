@@ -150,6 +150,30 @@ for (const tier of TIERS) {
       await expect(page.locator('#session-tabs .session-tab')).toHaveCount(2);
     });
 
+    test('首页 logo 刷新首页，不把已有会话接回终端页', async ({ page }) => {
+      const f = await sessionFixture(page);
+
+      await page.locator('.connect-host').first().click();
+      await expect.poll(() => f.sockets.length).toBe(1);
+      await backToOverview(page);
+      await expect(page.locator('#sessions-count')).toHaveText('1');
+
+      // It has to be a button: a link here would reload "/", and the startup
+      // session restore would then bounce the user straight into the terminal.
+      const logo = page.locator('.home-brand');
+      expect(await logo.evaluate((element) => element.tagName)).toBe('BUTTON');
+
+      const before = f.requests.hosts;
+      await logo.click();
+
+      // Still on 首页, still showing the live session, and it really refetched.
+      await expect(page.locator('#hosts-heading')).toBeVisible();
+      await expect(page.locator('#terminal-stage')).toBeHidden();
+      await expect(page.locator('#sessions-count')).toHaveText('1');
+      await expect.poll(() => f.requests.hosts).toBeGreaterThan(before);
+      await expect(page.locator('.connect-host').first()).toBeVisible();
+    });
+
     test('会话 UI 在三档断点下都不产生横向溢出', async ({ page }) => {
       const f = await sessionFixture(page);
 

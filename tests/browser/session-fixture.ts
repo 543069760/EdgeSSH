@@ -34,12 +34,14 @@ export async function sessionFixture(page: Page, options: SessionFixtureOptions 
   /** Serverside shells still held open after their tab vanished — what makes resuming possible. */
   const resumable = new Set<string>();
   const restoreCalls: string[] = [];
+  /** Counter for /api/hosts round trips — how a test proves the dashboard really reloaded. */
+  const requests = { hosts: 0 };
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === '/api/auth/me') {
       return route.fulfill({ json: { account: { username: 'Administrator' }, provider: 'cloudflare' } });
     }
-    if (path === '/api/hosts') return route.fulfill({ json: { hosts } });
+    if (path === '/api/hosts') { requests.hosts += 1; return route.fulfill({ json: { hosts } }); }
     if (path.endsWith('/credentials')) return route.fulfill({ json: { password: 'test-only-password' } });
     if (path === '/api/session') return route.fulfill({ json: { ticket: 'test-ticket', sessionId: crypto.randomUUID() } });
     if (path === '/api/session/restore') {
@@ -92,5 +94,5 @@ export async function sessionFixture(page: Page, options: SessionFixtureOptions 
     .filter((frame) => frame.type === 'input')
     .map((frame) => String(frame.data ?? ''))
     .join('');
-  return { hosts, connections, sockets, closes, frames, typed, resumable, restoreCalls };
+  return { hosts, connections, sockets, closes, frames, typed, resumable, restoreCalls, requests };
 }
