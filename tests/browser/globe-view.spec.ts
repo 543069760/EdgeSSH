@@ -29,7 +29,9 @@ const hosts = [
 const extents = (selector: string) => {
   const canvas = document.querySelector<HTMLCanvasElement>(selector)!;
   const { width, height } = canvas;
-  const css = canvas.clientWidth;
+  // Wide rather than square: the globe measures itself against the short side,
+  // the unrolled map against the width.
+  const css = canvas.clientWidth, cssH = canvas.clientHeight;
   const scale = width / css;
   const data = canvas.getContext('2d')!.getImageData(0, 0, width, height).data;
   let minX = width, minY = height, maxX = -1, maxY = -1;
@@ -41,7 +43,7 @@ const extents = (selector: string) => {
       }
     }
   }
-  return { css, x: minX / scale, y: minY / scale, w: (maxX - minX + 1) / scale, h: (maxY - minY + 1) / scale };
+  return { css, cssH, short: Math.min(css, cssH), x: minX / scale, y: minY / scale, w: (maxX - minX + 1) / scale, h: (maxY - minY + 1) / scale };
 };
 
 /**
@@ -145,9 +147,9 @@ test.describe('地图两种形态', () => {
     await openHome(page);
     const shape = await page.evaluate(extents, '#host-globe canvas');
     expect(Math.abs(shape.w - shape.h)).toBeLessThan(3);
-    // 0.81 of the container is the circle's diameter; allow for its 0.8px stroke.
-    expect(shape.w / shape.css).toBeGreaterThan(0.8);
-    expect(shape.w / shape.css).toBeLessThan(0.83);
+    // 0.81 of the shorter side is the circle's diameter; allow for its 0.8px stroke.
+    expect(shape.w / shape.short).toBeGreaterThan(0.8);
+    expect(shape.w / shape.short).toBeLessThan(0.83);
 
     const before = await fingerprint(page);
     await page.waitForTimeout(700);
@@ -165,12 +167,13 @@ test.describe('地图两种形态', () => {
 
     const shape = await page.evaluate(extents, '#host-globe canvas');
     // The globe used the middle 81% of the canvas and unrolled into a strip of
-    // the same width; the map takes the full width instead, keeping 2:1 and the
+    // the same width; the map takes the column's full width instead — about a
+    // quarter more map than the sphere could ever offer — keeping 2:1 and the
     // vertical centring. Allow for its 0.8px stroke.
-    expect(shape.w / shape.css).toBeGreaterThan(0.94);
-    expect(shape.w / shape.css).toBeLessThan(0.99);
+    expect(shape.w / shape.css).toBeGreaterThan(0.98);
+    expect(shape.w / shape.css).toBeLessThan(1.01);
     expect(shape.h / shape.w).toBeCloseTo(0.5, 1);
-    expect(Math.abs(shape.y - (shape.css - shape.h) / 2)).toBeLessThan(3);
+    expect(Math.abs(shape.y - (shape.cssH - shape.h) / 2)).toBeLessThan(3);
 
     // Even spacing everywhere, equator included: one step in both directions.
     const pitch = await page.evaluate(dotPitch, '#host-globe canvas');

@@ -11,8 +11,8 @@ const MORPH_MS = 720;
 const FLAT_CORNER = 10;
 /** Sphere diameter as a share of the square canvas — unchanged, it is the baseline every other size morphs against. */
 const SPHERE_RATIO = 0.405;
-/** Unrolled, the whole canvas width is fair game: the sphere was only using 81% of it. */
-const FLAT_WIDTH_RATIO = 0.96;
+/** Unrolled, the paper takes the column's full width — half a percent left over for its stroke. */
+const FLAT_WIDTH_RATIO = 0.995;
 /**
  * Map-only lattice, one step in both directions. On a 2:1 projection equal
  * steps in latitude and longitude land exactly square, so the dots come out
@@ -52,7 +52,8 @@ export class HostGlobe {
   private paused = false;
   private dragging = false;
   private pointerX = 0;
-  private size = 0;
+  private width = 0;
+  private height = 0;
   private view: GlobeView = 'sphere';
   /** 0 = sphere, 1 = fully unrolled; the one knob every draw path reads. */
   private progress = 0;
@@ -98,11 +99,13 @@ export class HostGlobe {
     this.resize = new ResizeObserver(() => {
       // A transient relayout can report zero width; resizing to 0 would wipe
       // the bitmap and never repaint it.
-      const width = root.clientWidth;
-      if (!width) return;
-      this.size = width;
+      const width = root.clientWidth, height = root.clientHeight;
+      if (!width || !height) return;
+      this.width = width;
+      this.height = height;
       const scale = Math.min(devicePixelRatio, 2);
-      this.canvas.width = this.canvas.height = Math.round(this.size * scale);
+      this.canvas.width = Math.round(width * scale);
+      this.canvas.height = Math.round(height * scale);
       this.context.setTransform(scale, 0, 0, scale, 0, 0);
       this.draw();
     });
@@ -222,20 +225,24 @@ export class HostGlobe {
   }
 
   private draw(): void {
-    if (!this.size) return;
-    const ctx = this.context, size = this.size, center = size / 2;
-    // The globe leaves ~19% of the canvas unused; unrolled, that width is the
-    // map's to take. Both extents collapse back to the sphere radius at t=0, so
-    // the morph stays continuous, and keeping exactly 2:1 is what lets the map's
-    // even lattice read as even once drawn.
-    const halfWidth = mix(size * SPHERE_RATIO, size * FLAT_WIDTH_RATIO / 2, this.progress);
+    if (!this.width || !this.height) return;
+    const ctx = this.context;
+    // The globe lives in the shorter side, so widening the box never changes it;
+    // unrolled, the paper takes the whole width instead — that is what buying the
+    // map a wider column buys. Both extents collapse to the sphere radius at t=0,
+    // so the morph stays continuous, and keeping exactly 2:1 is what lets the
+    // map's even lattice read as even once drawn.
+    const base = Math.min(this.width, this.height);
+    const radius = base * SPHERE_RATIO;
+    const cx = this.width / 2, cy = this.height / 2;
+    const halfWidth = mix(radius, this.width * FLAT_WIDTH_RATIO / 2, this.progress);
     // x spans ±1 and y spans ±0.5, so one scale covers both — it *is* half the
     // paper's width. Keeping the paper's own height in step with it at every t
     // (rather than easing two numbers independently) is what stops the dots from
     // spilling past the edges mid-unroll.
     const halfHeight = mix(1, 0.5, this.progress) * halfWidth;
-    ctx.clearRect(0, 0, size, size);
-    this.drawFrame(ctx, center, halfWidth, halfHeight);
+    ctx.clearRect(0, 0, this.width, this.height);
+    this.drawFrame(ctx, cx, cy, halfWidth, halfHeight);
     const drawLine = (points: Sample[]) => {
       ctx.beginPath(); let started = false;
       for (const point of points) {
@@ -243,8 +250,8 @@ export class HostGlobe {
         // z < 0 hides the far hemisphere on the globe; the map's radial depth
         // bottoms out at exactly 0, so nothing gets clipped once unrolled.
         if (z < 0) { started = false; continue; }
-        if (started) ctx.lineTo(center + x * halfWidth, center - y * halfWidth);
-        else ctx.moveTo(center + x * halfWidth, center - y * halfWidth);
+        if (started) ctx.lineTo(cx + x * halfWidth, cy - y * halfWidth);
+        else ctx.moveTo(cx + x * halfWidth, cy - y * halfWidth);
         started = true;
       }
       ctx.stroke();
@@ -262,7 +269,7 @@ export class HostGlobe {
         const [x, y, z] = this.place(point);
         if (z < 0) continue;
         ctx.globalAlpha = (0.25 + z * 0.7) * weight;
-        ctx.beginPath(); ctx.arc(center + x * halfWidth, center - y * halfWidth, (0.55 + z * 0.65) * size / 460, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(cx + x * halfWidth, cy - y * halfWidth, (0.55 + z * 0.65) * base / 460, 0, Math.PI * 2); ctx.fill();
       }
     };
     drawDots(this.samples, 1 - this.progress);
@@ -271,7 +278,7 @@ export class HostGlobe {
     const occupied: { x: number; y: number }[] = [];
     for (const marker of this.markers) {
       const [x, y, z] = this.place(marker.sample);
-      const px = center + x * halfWidth, py = center - y * halfWidth;
+      const px = cx + x * halfWidth, py = cy - y * halfWidth;
       // Same idea as the clip above: the map stops hiding markers as it opens.
       marker.button.hidden = z < 0.12 * (1 - this.progress);
       if (marker.button.hidden) continue;
@@ -285,10 +292,10 @@ export class HostGlobe {
   }
 
   /** A circle that unrolls into a 2:1 rounded rect — at t=0 the rect *is* the circle. */
-  private drawFrame(ctx: CanvasRenderingContext2D, center: number, halfWidth: number, halfHeight: number): void {
-    const corner = mix(this.size * SPHERE_RATIO, FLAT_CORNER, this.progress);
+  private drawFrame(ctx: CanvasRenderingContext2D, cx: number, cy: number, halfWidth: number, halfHeight: number): void {
+    const corner = mix(Math.min(this.width, this.height) * SPHERE_RATIO, FLAT_CORNER, this.progress);
     ctx.beginPath();
-    ctx.roundRect(center - halfWidth, center - halfHeight, halfWidth * 2, halfHeight * 2, Math.min(corner, halfHeight));
+    ctx.roundRect(cx - halfWidth, cy - halfHeight, halfWidth * 2, halfHeight * 2, Math.min(corner, halfHeight));
     ctx.fillStyle = this.paper; ctx.fill(); ctx.strokeStyle = this.grid; ctx.lineWidth = 0.8; ctx.stroke();
   }
 }

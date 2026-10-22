@@ -68,7 +68,9 @@ body[data-view='dashboard'] { overflow-y: auto; background: var(--home-bg); }
 .rail-security { margin-top: auto; padding: 24px 0 4px; text-align: center; color: var(--home-muted); font-size: 10px; }
 .rail-security svg { display: block; margin: 0 auto 8px; color: var(--home-success); }
 .home-content { width: 100%; max-width: 1450px; margin-inline: auto; padding: 36px 32px 20px; min-width: 0; }
-.home-main-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); min-height: 490px; }
+/* The two columns split evenly now: the wider one went to the map, whose flat
+   shape needs width far more than the list does. */
+.home-main-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); min-height: 490px; }
 .hosts-pane { padding-right: 28px; min-width: 0; }
 .home-section-heading { display: flex; gap: 16px; align-items: center; justify-content: space-between; margin-bottom: 23px; }
 .home-eyebrow { font-family: var(--home-mono); font-size: 10px; letter-spacing: 1.6px; font-weight: 500; margin: 0 0 10px; color: var(--home-muted); }
@@ -135,12 +137,16 @@ body[data-view='dashboard'] { overflow-y: auto; background: var(--home-bg); }
 .home-empty svg { display: block; margin: 0 auto 16px; color: var(--home-accent); }
 .home-empty strong { display: block; color: var(--home-ink); font-size: 16px; font-weight: 500; }
 .home-empty p { font-size: 12px; margin: 8px 0 0; }
-.globe-pane { position: relative; min-width: 0; padding: 0 0 0 24px; border-left: 1px solid var(--home-line); background-image: radial-gradient(var(--home-line) .75px, transparent .75px); background-size: 12px 12px; }
-.globe-heading { position: absolute; top: 4px; left: 26px; z-index: 15; pointer-events: none; }
+.globe-pane { position: relative; min-width: 0; padding: 0 0 0 12px; border-left: 1px solid var(--home-line); background-image: radial-gradient(var(--home-line) .75px, transparent .75px); background-size: 12px 12px; }
+.globe-heading { position: absolute; top: 4px; left: 14px; z-index: 15; pointer-events: none; }
 .globe-heading h2 { margin: 0; font-size: clamp(21px, 2vw, 28px); letter-spacing: -.8px; line-height: 1.35; font-weight: 650; }
 .globe-heading h2 span { color: var(--home-accent); }
 .globe-heading > p:last-child { color: var(--home-muted); font-size: 12px; margin-top: 8px; }
-.host-globe { width: min(100%, 520px); aspect-ratio: 1; margin: 38px auto 0; position: relative; }
+/* Wider than square: the globe only ever needed the short side, and the extra
+   width is exactly what the unrolled map draws itself with. The floor keeps the
+   globe its old size on narrower columns — only genuinely wide ones get the
+   extra width, so nothing ever shrinks to make room for the map. */
+.host-globe { width: min(100%, 640px); aspect-ratio: 1.15; min-height: 520px; margin: 38px auto 0; position: relative; }
 .host-globe canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: pan-y; }
 .host-globe canvas:active { cursor: grabbing; }
 #dashboard .globe-marker { position: absolute; top: 0; left: 0; display: flex; gap: 7px; align-items: center; padding: 0; margin: -10px 0 0 -10px; background: transparent; text-align: left; color: var(--home-ink); }
@@ -215,7 +221,9 @@ body[data-view='dashboard'] { overflow-y: auto; background: var(--home-bg); }
   .hosts-pane { padding-right: 0; }
   .globe-pane { margin-top: 30px; padding: 0; border-left: 0; border-top: 1px solid var(--home-line); }
   .globe-heading { top: 22px; left: 16px; }
-  .host-globe { max-width: 420px; margin-top: 24px; }
+  /* Stacked under the list there is no spare width to buy, so the box goes back
+     to being square and gives the globe the full span. */
+  .host-globe { max-width: 420px; margin-top: 24px; aspect-ratio: 1; min-height: 0; }
   .home-bottom { grid-template-columns: minmax(0, 1fr); }
   .home-search kbd { display: none; }
 }
