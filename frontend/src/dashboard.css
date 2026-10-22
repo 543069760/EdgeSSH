@@ -142,6 +142,16 @@ body[data-view='dashboard'] { overflow-y: auto; background: var(--home-bg); }
 .globe-heading h2 { margin: 0; font-size: clamp(21px, 2vw, 28px); letter-spacing: -.8px; line-height: 1.35; font-weight: 650; }
 .globe-heading h2 span { color: var(--home-accent); }
 .globe-heading > p:last-child { color: var(--home-muted); font-size: 12px; margin-top: 8px; }
+/* 大洲统计：紧贴标题右侧，沿用分组筛选chips的排字与选中下划线。 */
+.globe-title-row { display: flex; align-items: flex-start; gap: 26px; }
+.globe-stats { display: flex; flex-wrap: wrap; gap: 4px 12px; max-width: 268px; padding-top: 2px; pointer-events: auto; }
+#dashboard .globe-stat { padding: 5px 2px; color: var(--home-muted); background: none; font-size: 12px; white-space: nowrap; border-bottom: 3px solid transparent; }
+#dashboard .globe-stat b { color: var(--home-ink); font-family: var(--home-mono); font-weight: 650; }
+#dashboard .globe-stat:hover:not(:disabled) { color: var(--home-accent-hover); }
+#dashboard .globe-stat[aria-pressed="true"] { color: var(--home-ink); border-color: var(--home-accent); }
+#dashboard .globe-stat[aria-pressed="true"] b { color: var(--home-accent-hover); }
+/* 位置未知只是计数，没有可聚焦的地方，所以它不是可点的控件。 */
+#dashboard .globe-stat.is-unknown { cursor: default; opacity: .8; }
 /* Wider than square: the globe only ever needed the short side, and the extra
    width is exactly what the unrolled map draws itself with. The floor keeps the
    globe its old size on narrower columns — only genuinely wide ones get the
@@ -221,6 +231,9 @@ body[data-view='dashboard'] { overflow-y: auto; background: var(--home-bg); }
   .hosts-pane { padding-right: 0; }
   .globe-pane { margin-top: 30px; padding: 0; border-left: 0; border-top: 1px solid var(--home-line); }
   .globe-heading { top: 22px; left: 16px; }
+  /* 单列后标题右侧没有富余宽度，统计改为跟着标题换行排在下方。 */
+  .globe-title-row { flex-wrap: wrap; gap: 12px; }
+  .globe-stats { max-width: 100%; }
   /* Stacked under the list there is no spare width to buy, so the box goes back
      to being square and gives the globe the full span. */
   .host-globe { max-width: 420px; margin-top: 24px; aspect-ratio: 1; min-height: 0; }

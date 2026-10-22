@@ -9,6 +9,7 @@ const GLOBE_VIEW_KEY = 'edgessh.globe-view.v1';
 import { createElement, KeyRound } from 'lucide';
 import { Keychain, fillKeychainSelect } from './keychain';
 import { countryFlag } from './flags';
+import { isContinent, regionStats, regionView, type RegionKey } from './continents';
 import { systemIcon } from './os-icons';
 import { testConnection } from './connection-test';
 import { sessionTargetKey } from './session-target';
@@ -64,6 +65,8 @@ export class Dashboard {
   private isHome = true;
   private paused = false;
   private globeView: GlobeView = 'sphere';
+  /** Continent the map is framing, or null for the whole spinning world. */
+  private region: RegionKey | null = null;
   private authenticated = false;
   private returnFocus?: HTMLElement;
   private readonly dialog: HTMLDialogElement;
@@ -116,7 +119,7 @@ export class Dashboard {
               <div class="host-list-footer"><span id="host-total">0 台主机</span><button class="home-text-button" id="refresh-hosts">刷新列表 ↻</button></div>
             </section>
             <section class="globe-pane" aria-labelledby="globe-heading">
-              <div class="globe-heading"><p class="home-eyebrow">A SMALLER WORLD</p><h2 id="globe-heading">散布全球，<br><span>就在手边。</span></h2><p>点击国旗，即刻连接。</p></div>
+              <div class="globe-heading"><p class="home-eyebrow">A SMALLER WORLD</p><div class="globe-title-row"><h2 id="globe-heading">散布全球，<br><span>就在手边。</span></h2><div class="globe-stats" id="globe-stats" role="group" aria-label="按大洲查看主机分布"></div></div><p>点击国旗，即刻连接。</p></div>
               <div class="host-globe" id="host-globe" aria-label="主机地理分布，可拖动旋转；也可使用主机列表连接"></div>
               <div class="globe-meta"><span id="region-count">0 个地区</span><span class="globe-actions"><button id="pause-globe" class="home-text-button" aria-pressed="false">暂停旋转</button><button id="globe-view" class="home-text-button" aria-pressed="false">平铺地图</button></span></div>
               <p class="globe-caption">城市级近似定位 · 位置不代表在线状态</p>
@@ -306,6 +309,8 @@ export class Dashboard {
       this.globe.setActive(this.isHome && !this.paused);
       // Restore without replaying the unroll animation on every page load.
       if (this.globeView !== 'sphere') this.globe.setView(this.globeView, false);
+      // A chip can be picked before this dynamic import lands.
+      if (this.region && isContinent(this.region)) this.globe.focusRegion(regionView(this.region, this.hosts), false);
     } catch { this.get('#host-globe').textContent = '地图暂不可用，请从主机列表连接。'; }
   }
 
@@ -331,7 +336,7 @@ export class Dashboard {
     this.actions.files.setHosts(hosts);
     this.forwarding.setHosts(hosts);
     if (this.group && !hosts.some((host) => host.group === this.group)) this.group = '';
-    this.renderFilters(); this.renderList();
+    this.renderFilters(); this.renderList(); this.renderRegions();
     this.globe?.setHosts(hosts);
     this.get('#region-count').textContent = `${new Set(hosts.map((host) => host.location?.countryCode).filter(Boolean)).size} 个国家 / 地区`;
     this.get('#host-total').textContent = `${hosts.length} 台主机 · ${hosts.filter((host) => !host.location).length} 台位置未知`;
@@ -685,6 +690,42 @@ export class Dashboard {
       button.addEventListener('click', () => { this.group = group; this.renderFilters(); this.renderList(); });
       root.append(button);
     }
+  }
+
+  /**
+   * One chip per continent that actually has hosts, then the unresolved tail.
+   * Selecting a continent frames it on the map; selecting it again lets the
+   * world go back to spinning.
+   */
+  private renderRegions(): void {
+    const rows = regionStats(this.hosts);
+    // A continent can lose its last host to a rename or a delete; the map has
+    // to be released along with the chip, or it would stay zoomed into nothing.
+    if (this.region && !rows.some((row) => row.key === this.region)) this.region = null;
+    const root = this.get('#globe-stats'); root.replaceChildren();
+    for (const row of rows) {
+      const button = document.createElement('button'); button.type = 'button';
+      button.className = row.key === 'unknown' ? 'globe-stat is-unknown' : 'globe-stat';
+      button.setAttribute('aria-pressed', String(this.region === row.key));
+      const label = document.createElement('span'); label.textContent = row.label;
+      const count = document.createElement('b'); count.textContent = String(row.count);
+      button.append(label, document.createTextNode('：'), count);
+      if (row.key === 'unknown') {
+        // Nothing to turn towards, so the chip is a count and not a control.
+        button.disabled = true;
+        button.title = '这些主机没有解析到地理位置';
+      } else {
+        button.title = this.region === row.key ? `取消聚焦${row.label}` : `在地图上聚焦${row.label}`;
+        button.addEventListener('click', () => this.selectRegion(this.region === row.key ? null : row.key));
+      }
+      root.append(button);
+    }
+  }
+
+  private selectRegion(key: RegionKey | null): void {
+    this.region = key;
+    this.renderRegions();
+    this.globe?.focusRegion(key && isContinent(key) ? regionView(key, this.hosts) : null);
   }
 
   private renderList(): void {

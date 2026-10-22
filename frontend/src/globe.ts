@@ -1,5 +1,6 @@
 import { isLand } from 'mappo';
 import type { CloudHost } from './cloud-api';
+import { fitZoom, type RegionView } from './continents';
 import { countryFlagEmoji } from './flags';
 
 type Point = [number, number, number];
@@ -59,6 +60,17 @@ export class HostGlobe {
   private progress = 0;
   private morphFrom = 0;
   private morphAt = 0;
+  /** Latest frame *after* the release: 0 shows the world, 1 frames one region. */
+  private focusT = 0;
+  private focusFrom = 0;
+  private focusAt = 0;
+  private focused = false;
+  /** Eased centre + magnification of the unrolled map; defaults frame the world. */
+  private mapLon = 0;
+  private mapLat = 0;
+  private mapZoom = 1;
+  private focusEase = { lon: 0, lat: 0, zoom: 1, angle: 0 };
+  private focusStart = { lon: 0, lat: 0, zoom: 1, angle: 0 };
   private readonly resize: ResizeObserver;
   private readonly orange: string;
   private readonly grid: string;
@@ -172,14 +184,76 @@ export class HostGlobe {
 
   get currentView(): GlobeView { return this.view; }
 
+  /**
+   * Frame one region — the sphere turns to face it and holds still, the map
+   * crops down to its bounds — or `null` to release it back to the whole,
+   * spinning world. Kept as one call so switching shapes while a region is
+   * selected keeps presenting whatever is already chosen.
+   */
+  focusRegion(view: RegionView | null, animate = true): void {
+    const now = { lon: this.mapLon, lat: this.mapLat, zoom: this.mapZoom, angle: this.angle };
+    const goal = view ? this.plan(view) : { lon: 0, lat: 0, zoom: 1, angle: this.angle };
+    // t=0 always means `from` and t=1 always means `to`: framing a region runs
+    // the timeline forwards, releasing it rewinds those same two frames — so
+    // letting go lands on the whole world rather than on the crop it came from.
+    const from = view ? now : goal;
+    const to = view ? goal : now;
+    // Pick the coterminal turn nearest the starting angle; without this the
+    // globe would unwind several full revolutions to reach, say, Arizona.
+    const turn = Math.PI * 2;
+    to.angle += Math.round((from.angle - to.angle) / turn) * turn;
+    this.focused = view !== null;
+    this.focusStart = from;
+    this.focusEase = to;
+    this.focusFrom = this.focusT;
+    this.focusAt = performance.now();
+    if (!animate) { this.focusT = view ? 1 : 0; this.applyFocus(); return; }
+    this.schedule();
+  }
+
+  /** Where a region sits on the map: its centre, plus how far to magnify it. */
+  private plan(view: RegionView): { lon: number; lat: number; zoom: number; angle: number } {
+    const [west, east, south, north] = view.bounds;
+    const lon = wrap((west + east) / 2), lat = (south + north) / 2;
+    return { lon, lat, zoom: fitZoom(view.bounds), angle: -view.centerLon * Math.PI / 180 };
+  }
+
+  private applyFocus(): void {
+    const { lon, lat, zoom, angle } = this.focusEase;
+    const t = this.focusT;
+    this.mapLon = this.focusStart.lon + (lon - this.focusStart.lon) * t;
+    this.mapLat = this.focusStart.lat + (lat - this.focusStart.lat) * t;
+    this.mapZoom = this.focusStart.zoom + (zoom - this.focusStart.zoom) * t;
+    this.angle = this.focusStart.angle + (angle - this.focusStart.angle) * t;
+  }
+
+  /** True while the turn/crop away from the whole world is still settling. */
+  private focusMoving(): boolean { return this.focusT !== (this.focused ? 1 : 0); }
+
   private schedule(): void {
     cancelAnimationFrame(this.frame);
     this.last = 0;
-    if (this.motion.matches) { this.progress = this.view === 'flat' ? 1 : 0; this.draw(); return; }
+    if (this.motion.matches) {
+      this.progress = this.view === 'flat' ? 1 : 0;
+      this.focusT = this.focused ? 1 : 0;
+      this.applyFocus();
+      this.draw();
+      return;
+    }
     if (!this.active || document.hidden) { this.draw(); return; }
     // Unrolled + settled: nothing will move again, so don't hold a frame loop.
-    if (this.view === 'flat' && this.progress === 1) { this.draw(); return; }
+    if (this.view === 'flat' && this.progress === 1 && !this.focusMoving()) { this.draw(); return; }
     this.frame = requestAnimationFrame(this.tick);
+  }
+
+  /** The turn towards (or the return from) a region, on its own eased timeline. */
+  private advanceFocus(time: number): void {
+    const target = this.focused ? 1 : 0;
+    if (this.focusT === target) return;
+    const ratio = Math.min(1, (time - this.focusAt) / MORPH_MS);
+    const eased = ratio < 0.5 ? 2 * ratio * ratio : 1 - 2 * (1 - ratio) ** 2;
+    this.focusT = ratio >= 1 ? target : mix(this.focusFrom, target, eased);
+    this.applyFocus();
   }
 
   private advance(time: number): void {
@@ -195,10 +269,20 @@ export class HostGlobe {
     const delta = this.last ? Math.min(time - this.last, 100) : 0;
     this.last = time;
     this.advance(time);
-    // Only the sphere spins — the map is the whole world laid out at once.
-    if (this.progress < 1 && !this.paused && !this.dragging) this.angle += delta * AUTO_ROTATION_SPEED;
+    this.advanceFocus(time);
+    const settled = this.progress === (this.view === 'flat' ? 1 : 0);
+    // Only the sphere spins — the map is the whole world laid out at once, and
+    // a region being framed is held still until it is released.
+    if (this.progress < 1 && !this.paused && !this.dragging && !this.focused && !this.focusMoving()) {
+      this.angle += delta * AUTO_ROTATION_SPEED;
+    }
     this.draw();
-    if (this.view === 'flat' && this.progress === 1) { this.last = 0; return; }
+    // Holding a region still needs no frames once the turn/crop has arrived;
+    // before that — and always when nothing is framed — the loop keeps running.
+    if (settled && this.focused && !this.focusMoving()) { this.last = 0; return; }
+    // A settled map holds nothing else that moves — unless it is mid-way through
+    // zooming into, or back out of, a region.
+    if (this.view === 'flat' && this.progress === 1 && !this.focusMoving()) { this.last = 0; return; }
     this.frame = requestAnimationFrame(this.tick);
   };
 
@@ -217,8 +301,10 @@ export class HostGlobe {
     const sz = y * Math.sin(tilt) + rz * Math.cos(tilt);
     // The map is centred on the prime meridian; easing the offset out keeps
     // the unroll continuous even if the globe was mid-spin.
-    const u = wrap(lon + this.angle * (180 / Math.PI) * (1 - this.progress)) / 180;
-    const v = lat / 90;
+    // Zoomed in, an unrolled map *is* a window onto the degrees: the same
+    // 1/180 scale keeps x and y in proportion, so magnifying never distorts.
+    const u = wrap(lon + this.angle * (180 / Math.PI) * (1 - this.progress) - this.mapLon) / 180 * this.mapZoom;
+    const v = (lat - this.mapLat) / 90 * this.mapZoom;
     const radial = 1 - Math.min(1, Math.hypot(u, v * FLAT_DEPTH_V));
     // Latitude runs north-up, matching the sphere where +y draws upward.
     return [mix(rx, u, this.progress), mix(sy, v * 0.5, this.progress), mix(sz, radial, this.progress)];
@@ -243,6 +329,12 @@ export class HostGlobe {
     const halfHeight = mix(1, 0.5, this.progress) * halfWidth;
     ctx.clearRect(0, 0, this.width, this.height);
     this.drawFrame(ctx, cx, cy, halfWidth, halfHeight);
+    // Zoomed into one region the map runs past its own paper, so everything has
+    // to be clipped to it — otherwise the rest of the world's dots would spill
+    // out across the dashboard. At world scale nothing can leave the paper and
+    // no clip is ever set, leaving the unrolled look exactly as it was.
+    const clipped = this.mapZoom > 1.001 && this.progress > 0.01;
+    if (clipped) { ctx.save(); this.framePath(ctx, cx, cy, halfWidth, halfHeight); ctx.clip(); }
     const drawLine = (points: Sample[]) => {
       ctx.beginPath(); let started = false;
       for (const point of points) {
@@ -275,12 +367,15 @@ export class HostGlobe {
     drawDots(this.samples, 1 - this.progress);
     drawDots(this.flatSamples, this.progress);
     ctx.globalAlpha = 1;
+    if (clipped) ctx.restore();
     const occupied: { x: number; y: number }[] = [];
     for (const marker of this.markers) {
       const [x, y, z] = this.place(marker.sample);
       const px = cx + x * halfWidth, py = cy - y * halfWidth;
       // Same idea as the clip above: the map stops hiding markers as it opens.
-      marker.button.hidden = z < 0.12 * (1 - this.progress);
+      // The second test drops whatever the zoom has pushed off the paper.
+      const outside = Math.abs(x) > mix(1.05, 1.02, this.progress) || Math.abs(y) > mix(1.05, 0.52, this.progress);
+      marker.button.hidden = z < 0.12 * (1 - this.progress) || outside;
       if (marker.button.hidden) continue;
       // 密集地区折叠文字而不是堆叠卡片；每台机器始终还可从左侧列表连接。
       const overlap = occupied.some((other) => Math.abs(other.x - px) < 100 && Math.abs(other.y - py) < 44);
@@ -293,9 +388,13 @@ export class HostGlobe {
 
   /** A circle that unrolls into a 2:1 rounded rect — at t=0 the rect *is* the circle. */
   private drawFrame(ctx: CanvasRenderingContext2D, cx: number, cy: number, halfWidth: number, halfHeight: number): void {
+    this.framePath(ctx, cx, cy, halfWidth, halfHeight);
+    ctx.fillStyle = this.paper; ctx.fill(); ctx.strokeStyle = this.grid; ctx.lineWidth = 0.8; ctx.stroke();
+  }
+
+  private framePath(ctx: CanvasRenderingContext2D, cx: number, cy: number, halfWidth: number, halfHeight: number): void {
     const corner = mix(Math.min(this.width, this.height) * SPHERE_RATIO, FLAT_CORNER, this.progress);
     ctx.beginPath();
     ctx.roundRect(cx - halfWidth, cy - halfHeight, halfWidth * 2, halfHeight * 2, Math.min(corner, halfHeight));
-    ctx.fillStyle = this.paper; ctx.fill(); ctx.strokeStyle = this.grid; ctx.lineWidth = 0.8; ctx.stroke();
   }
 }
