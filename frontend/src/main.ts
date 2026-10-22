@@ -278,6 +278,7 @@ const ui = {
   themeToggle: element<HTMLButtonElement>('theme-toggle'),
   sessionTitle: element<HTMLElement>('session-title'),
   sessionSubtitle: element<HTMLElement>('session-subtitle'),
+  sessionFlag: element<HTMLElement>('session-flag'),
   liveOrb: element<HTMLElement>('live-orb'),
   liveOrbLabel: element<HTMLElement>('live-orb-label'),
   metricUptime: element<HTMLElement>('metric-uptime'),
@@ -1191,6 +1192,8 @@ async function deleteProfile(id: string): Promise<void> {
 
 function renderProfiles(): void {
   dashboard?.setHosts(profiles);
+  // 名称和国旗来自主机列表，它可能比连接本身晚一步到达，所以每次重画都带上顶栏。
+  renderSessionHeader();
   ui.profileList.replaceChildren();
   ui.profileCount.textContent = String(profiles.length);
   if (profiles.length === 0) {
@@ -2041,7 +2044,7 @@ async function connect(options: { newSession?: boolean } = {}): Promise<void> {
   session.pendingHostKey = null;
   session.awaitingHostKeyDecision = false;
   session.decoder = createDecoder(ui.encoding.value);
-  ui.sessionTitle.textContent = session.targetLabel;
+  renderSessionHeader(session);
   updateConnectionStatus(localized('正在授权 Worker 会话...', 'Authorizing Worker session...'));
   ui.metricHostKey.textContent = '--';
   event(bilingual(`正在连接 ${session.targetLabel}`, `Starting ${session.targetLabel}`), 'connect');
@@ -2367,13 +2370,45 @@ function retireSession(session: SessionContext): void {
  * paths (tab tap, new dial, another session retiring) and every one of them is
  * entitled to leave with the shared widgets owned by the front session.
  */
+/**
+ * The header answers "where am I" the same way the host list does — flag, host
+ * name, then `user@host:port` — and keeps the shell state on the line below.
+ * Only the address used to be there, which left two perfectly good facts (which
+ * country, which saved host) unused while the list right beside it showed them.
+ * Resolved lazily from `profiles` because the location arrives with the host
+ * list, not with the dial.
+ */
+function renderSessionHeader(session: SessionContext = ctx): void {
+  const profile = session.targetKey
+    ? profiles.find((candidate) => sessionTargetKey(candidate.host, candidate.port, candidate.username) === session.targetKey)
+    : undefined;
+  const label = session.targetLabel || bilingual('无活动会话', 'No active session');
+  const name = profile?.name.trim();
+  ui.sessionTitle.textContent = name ? `${name} · ${label}` : label;
+
+  const flag = ui.sessionFlag;
+  flag.replaceChildren();
+  const location = profile?.location;
+  if (!location?.countryCode) {
+    flag.hidden = true;
+    flag.removeAttribute('role'); flag.removeAttribute('aria-label'); flag.removeAttribute('title');
+    return;
+  }
+  const place = [location.city || location.region || location.country, location.country].filter(Boolean).join(' · ');
+  flag.append(countryFlag(location.countryCode));
+  flag.hidden = false;
+  flag.setAttribute('role', 'img');
+  flag.setAttribute('aria-label', place);
+  flag.title = place;
+}
+
 function setFrontSession(session: SessionContext): void {
   ctx = session;
   // The topbar host name belongs to the session in front. The meters and the
   // orb already follow a tab tap through mountSessionPanels()/setState(); the
   // title was only written by connect() and resumeSession(), so switching tabs
   // left the previous host's name on screen.
-  ui.sessionTitle.textContent = session.targetLabel || bilingual('无活动会话', 'No active session');
+  renderSessionHeader(session);
   syncFormToSession(session);
   sessions.activate(session.id);
   showOnlyTerminal(session);
@@ -2684,7 +2719,7 @@ ui.languageToggle.addEventListener('click', () => {
   renderProfiles();
   setState(ctx.state);
   setPanelOpen(panelOpen);
-  if (ctx.state === 'idle' && !ctx.targetLabel) ui.sessionTitle.textContent = bilingual('无活动会话', 'No active session');
+  if (ctx.state === 'idle' && !ctx.targetLabel) renderSessionHeader(ctx);
 });
 ui.themeToggle.addEventListener('click', () => {
   const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
@@ -2750,7 +2785,7 @@ async function initialize(): Promise<void> {
   setAuthMethod('password');
   setState('idle');
   setWorkspaceTab(null);
-  ui.sessionTitle.textContent = bilingual('无活动会话', 'No active session');
+  renderSessionHeader(ctx);
   ui.sessionSubtitle.textContent = bilingual('选择目标并连接', 'Choose a target and connect');
   ui.eventMessage.textContent = bilingual('Worker 运行时待命', 'Worker runtime standing by');
   initializeCompatibilityAPI();
@@ -2781,7 +2816,7 @@ async function initialize(): Promise<void> {
   dashboard = new Dashboard({
     keychain,
     files: filePage,
-    snippets: new Snippets(ui.terminalCard, (snippet) => {
+    snippets: new Snippets(document.querySelector<HTMLElement>('#app .topbar-actions')!, (snippet) => {
       // 片段只进入草稿，尤其多行命令不能通过粘贴意外立即执行。
       const input = document.getElementById('command-editor-input') as HTMLTextAreaElement;
       if (input.value.trim() && input.value !== snippet.command

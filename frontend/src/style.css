@@ -1056,6 +1056,20 @@ button:disabled {
   font-size: 12px;
 }
 
+/* 国旗沿用左侧主机列表的那一套；没有已知位置时整块让位给文字。 */
+.session-flag {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  overflow: visible;
+}
+
+.session-flag .country-flag {
+  width: 22px;
+  height: 16px;
+  border-radius: 2px;
+}
+
 .session-target span {
   color: var(--term-muted-2);
   font-family: var(--mono);
@@ -3168,6 +3182,11 @@ button:disabled {
   .session-target {
     flex: 0 1 88px;
     gap: 6px;
+  }
+
+  /* 这一档留给标题的空间只够 user@host，国旗让位。 */
+  .session-flag {
+    display: none;
   }
 
   .resource-metrics {

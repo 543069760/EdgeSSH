@@ -1,16 +1,18 @@
 import { expect, type Page, type WebSocketRoute } from '@playwright/test';
 
 /** One host with credentials; the dashboard row and the session targetKey both come from this. */
-export const sshHost = (id: string, name: string, address: string) => ({
+export const sshHost = (id: string, name: string, address: string, location: object | null = null) => ({
   id, name, host: address, port: 22, username: 'root', group: '测试主机',
   authMethod: 'password', initialCommand: '', termType: 'xterm-256color',
-  encoding: 'utf-8', fingerprint: '', location: null, system: null,
+  encoding: 'utf-8', fingerprint: '', location, system: null,
   hasCredential: true, updatedAt: Date.now(),
 });
 
 export interface SessionFixtureOptions {
   /** How many saved hosts to expose; the first two keep the names existing specs assert on. */
   hostCount?: number;
+  /** Per-host location, in list order: the profile row and the terminal header both draw their flag from it. */
+  locations?: (object | null)[];
 }
 
 /**
@@ -26,6 +28,7 @@ export async function sessionFixture(page: Page, options: SessionFixtureOptions 
     index === 0 ? 'alpha' : index === 1 ? 'beta' : `host-${index + 1}`,
     index === 0 ? 'Tokyo production' : index === 1 ? 'Singapore backup' : `Host ${index + 1}`,
     `192.0.2.${(index + 1) * 10}`,
+    options.locations?.[index] ?? null,
   ));
   const connections: any[] = [];
   const sockets: WebSocketRoute[] = [];

@@ -57,6 +57,52 @@ const fingerprint = (page: import('@playwright/test').Page) => page.evaluate(() 
   return `${width}x${height}:${hash}`;
 });
 
+/**
+ * Median gap between neighbouring dots in three latitude bands, in CSS pixels.
+ * Each scanline only walks short hops — oceans read as much wider gaps and are
+ * skipped — so what is left is the lattice pitch. The globe's rows thin towards
+ * the poles (equal area on a sphere), which unrolled into visible streaks before
+ * the map got a lattice of its own: even in one direction means even in the other
+ * on a 2:1 projection.
+ */
+const dotPitch = (selector: string) => {
+  const canvas = document.querySelector<HTMLCanvasElement>(selector)!;
+  const { width, height } = canvas;
+  const scale = width / canvas.clientWidth;
+  const data = canvas.getContext('2d')!.getImageData(0, 0, width, height).data;
+  const dot = (x: number, y: number) => {
+    const i = (y * width + x) * 4;
+    return data[i + 3] > 40 && data[i] - data[i + 2] > 22; // 橙色圆点；纸面是中性的
+  };
+  let minX = width, minY = height, maxX = -1, maxY = -1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (!dot(x, y)) continue;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+  }
+  const band = (from: number, to: number) => {
+    const gaps: number[] = [];
+    for (let y = Math.round(from); y < Math.round(to); y += 2) {
+      let previous = -1, open = false;
+      for (let x = minX; x <= maxX; x += 1) {
+        if (!dot(x, y)) { open = false; continue; }
+        if (!open && previous >= 0 && x - previous < 20) gaps.push(x - previous);
+        if (!open) previous = x;
+        open = true;
+      }
+    }
+    gaps.sort((a, b) => a - b);
+    return gaps.length ? gaps[Math.floor(gaps.length / 2)] / scale : 0;
+  };
+  return {
+    top: band(minY + 2, minY + (maxY - minY) * 0.2),
+    middle: band(minY + (maxY - minY) * 0.45, minY + (maxY - minY) * 0.55),
+    bottom: band(maxY - (maxY - minY) * 0.2, maxY - 2),
+  };
+};
+
 async function openHome(page: import('@playwright/test').Page) {
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -118,11 +164,18 @@ test.describe('地图两种形态', () => {
     await page.waitForTimeout(1200);
 
     const shape = await page.evaluate(extents, '#host-globe canvas');
-    // Same width as the globe, half the height, vertically centred.
-    expect(shape.w / shape.css).toBeGreaterThan(0.8);
-    expect(shape.w / shape.css).toBeLessThan(0.83);
+    // The globe used the middle 81% of the canvas and unrolled into a strip of
+    // the same width; the map takes the full width instead, keeping 2:1 and the
+    // vertical centring. Allow for its 0.8px stroke.
+    expect(shape.w / shape.css).toBeGreaterThan(0.94);
+    expect(shape.w / shape.css).toBeLessThan(0.99);
     expect(shape.h / shape.w).toBeCloseTo(0.5, 1);
     expect(Math.abs(shape.y - (shape.css - shape.h) / 2)).toBeLessThan(3);
+
+    // Even spacing everywhere, equator included: one step in both directions.
+    const pitch = await page.evaluate(dotPitch, '#host-globe canvas');
+    expect(Math.abs(pitch.top - pitch.middle)).toBeLessThan(2);
+    expect(Math.abs(pitch.bottom - pitch.middle)).toBeLessThan(2);
 
     const settled = await fingerprint(page);
     await page.waitForTimeout(800);
