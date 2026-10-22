@@ -2369,6 +2369,11 @@ function retireSession(session: SessionContext): void {
  */
 function setFrontSession(session: SessionContext): void {
   ctx = session;
+  // The topbar host name belongs to the session in front. The meters and the
+  // orb already follow a tab tap through mountSessionPanels()/setState(); the
+  // title was only written by connect() and resumeSession(), so switching tabs
+  // left the previous host's name on screen.
+  ui.sessionTitle.textContent = session.targetLabel || bilingual('无活动会话', 'No active session');
   syncFormToSession(session);
   sessions.activate(session.id);
   showOnlyTerminal(session);
